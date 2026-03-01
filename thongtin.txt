@@ -1,0 +1,11 @@
+PORT=8050
+DB_HOST=116.118.44.16
+DB_PORT=5434
+DB_USER=antigravity_admin
+DB_PASSWORD=AntigravityHub2026!
+DB_NAME=db_license
+
+API_KEY=antigravity_license_master_key_2026
+API_ENCRYPTION_KEY=ag_license_secure_enc_key_32bytes
+ALLOWED_ORIGINS=*
+NODE_ENV=development
