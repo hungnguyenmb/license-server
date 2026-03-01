@@ -1,0 +1,26 @@
+{
+    "name": "antigravity-nodejs-api",
+    "version": "1.0.0",
+    "description": "Secure API Boilerplate for Antigravity",
+    "main": "src/index.js",
+    "scripts": {
+        "start": "node src/index.js",
+        "dev": "nodemon src/index.js"
+    },
+    "dependencies": {
+        "bcryptjs": "^3.0.3",
+        "cors": "^2.8.6",
+        "cryptography": "^0.1.0",
+        "dotenv": "^16.6.1",
+        "express": "^4.22.1",
+        "express-rate-limit": "^6.11.2",
+        "jsonwebtoken": "^9.0.3",
+        "pg": "^8.18.0"
+    },
+    "devDependencies": {
+        "nodemon": "^2.0.22"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC"
+}

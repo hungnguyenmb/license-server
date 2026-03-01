@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  license-server:
+    build: .
+    container_name: antigravity-license-server
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "8050:8050"
+    networks:
+      - antigravity_network
+
+networks:
+  antigravity_network:
+    external: true
