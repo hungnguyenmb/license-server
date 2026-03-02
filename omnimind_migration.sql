@@ -65,6 +65,31 @@ CREATE TABLE IF NOT EXISTS purchased_skills (
     purchased_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 7. omnimind_codex_releases: Ma trận link tải Codex theo OS + Arch
+CREATE TABLE IF NOT EXISTS omnimind_codex_releases (
+    id SERIAL PRIMARY KEY,
+    platform VARCHAR(20) NOT NULL,             -- darwin / win32 / linux
+    arch VARCHAR(20) NOT NULL,                 -- arm64 / x64 / ...
+    channel VARCHAR(20) NOT NULL DEFAULT 'stable',
+    version VARCHAR(40) NOT NULL,
+    url TEXT NOT NULL,
+    checksum VARCHAR(128) DEFAULT '',
+    file_name VARCHAR(255) DEFAULT '',
+    size_bytes BIGINT,
+    method VARCHAR(32) NOT NULL DEFAULT 'zip_extract',
+    notes TEXT DEFAULT '',
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(platform, arch, channel)
+);
+
+INSERT INTO omnimind_codex_releases (platform, arch, channel, version, url, method, is_active, file_name)
+VALUES
+('darwin', 'arm64', 'stable', '1.5.0', 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-macos-arm64.zip', 'zip_extract', TRUE, 'codex-macos-arm64.zip'),
+('win32', 'x64', 'stable', '1.5.0', 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-windows-x64.zip', 'zip_extract', TRUE, 'codex-windows-x64.zip')
+ON CONFLICT (platform, arch, channel) DO NOTHING;
+
 -- Thêm cột plan_id và issued_source vào bảng licenses hiện có (nếu chưa có)
 DO $$
 BEGIN

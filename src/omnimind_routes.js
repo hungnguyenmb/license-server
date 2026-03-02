@@ -12,6 +12,32 @@ const logFile = path.join(__dirname, '../debug_omnimind.log');
 module.exports = function (app, db, authMiddleware) {
     const SUPPORTED_SKILL_TYPES = new Set(['KNOWLEDGE', 'TOOL']);
     const SUPPORTED_PLATFORMS = ['darwin', 'win32', 'linux'];
+    const SUPPORTED_ARCH_BY_PLATFORM = {
+        darwin: ['arm64', 'x64'],
+        win32: ['x64', 'arm64'],
+        linux: ['x64', 'arm64'],
+    };
+    const DEFAULT_CODEX_RELEASE_MATRIX = {
+        darwin: {
+            arm64: {
+                version: '1.5.0',
+                url: 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-macos-arm64.zip',
+                method: 'zip_extract',
+                checksum: '',
+                file_name: 'codex-macos-arm64.zip',
+            },
+        },
+        win32: {
+            x64: {
+                version: '1.5.0',
+                url: 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-windows-x64.zip',
+                method: 'zip_extract',
+                checksum: '',
+                file_name: 'codex-windows-x64.zip',
+            },
+        },
+        linux: {},
+    };
     const ALLOWED_CAPABILITIES = new Set([
         'screen_capture',
         'camera_access',
@@ -90,6 +116,32 @@ module.exports = function (app, db, authMiddleware) {
         return 'unknown';
     };
 
+    const normalizeArch = (platformKey, input = '') => {
+        const raw = String(input || '').trim().toLowerCase();
+        const alias = {
+            x86_64: 'x64',
+            amd64: 'x64',
+            x64: 'x64',
+            i386: 'x86',
+            i686: 'x86',
+            aarch64: 'arm64',
+            arm64: 'arm64',
+            armv7l: 'armv7',
+        };
+        const normalized = alias[raw] || raw || 'unknown';
+        const supported = SUPPORTED_ARCH_BY_PLATFORM[platformKey] || [];
+        if (!supported.length) return normalized;
+        if (supported.includes(normalized)) return normalized;
+        return normalized;
+    };
+
+    const isSupportedReleaseTarget = (platformKey, arch) => {
+        if (!SUPPORTED_PLATFORMS.includes(platformKey)) return false;
+        const supported = SUPPORTED_ARCH_BY_PLATFORM[platformKey] || [];
+        if (!supported.length) return true;
+        return supported.includes(arch);
+    };
+
     const resolveDownloadInfo = (manifest, platformKey) => {
         const sources = [
             manifest?.downloads?.[platformKey],
@@ -117,6 +169,199 @@ module.exports = function (app, db, authMiddleware) {
             return { url: String(manifest.download_url).trim() };
         }
         return {};
+    };
+
+    const normalizeCodexReleaseRecord = (raw = {}) => {
+        const platform = normalizePlatform(raw.platform || raw.os_name || '');
+        const arch = normalizeArch(platform, raw.arch || raw.cpu_arch || '');
+        const version = toNonEmptyString(raw.version);
+        const url = toNonEmptyString(raw.url);
+        const method = toNonEmptyString(raw.method) || 'zip_extract';
+        const checksum = toNonEmptyString(raw.checksum);
+        const fileName = toNonEmptyString(raw.file_name);
+        const channel = toNonEmptyString(raw.channel) || 'stable';
+        const notes = toNonEmptyString(raw.notes);
+
+        const sizeVal = Number(raw.size_bytes ?? raw.size ?? null);
+        const sizeBytes = Number.isFinite(sizeVal) && sizeVal > 0 ? Math.trunc(sizeVal) : null;
+        const isActive = raw.is_active === undefined ? true : Boolean(raw.is_active);
+
+        return {
+            platform,
+            arch,
+            version,
+            url,
+            method,
+            checksum,
+            file_name: fileName,
+            size_bytes: sizeBytes,
+            channel,
+            notes,
+            is_active: isActive,
+        };
+    };
+
+    let codexReleaseSchemaReady = false;
+    const ensureCodexReleaseSchema = async () => {
+        if (codexReleaseSchemaReady) return;
+        await db.query(`
+            CREATE TABLE IF NOT EXISTS omnimind_codex_releases (
+                id SERIAL PRIMARY KEY,
+                platform VARCHAR(20) NOT NULL,
+                arch VARCHAR(20) NOT NULL,
+                channel VARCHAR(20) NOT NULL DEFAULT 'stable',
+                version VARCHAR(40) NOT NULL,
+                url TEXT NOT NULL,
+                checksum VARCHAR(128) DEFAULT '',
+                file_name VARCHAR(255) DEFAULT '',
+                size_bytes BIGINT,
+                method VARCHAR(32) NOT NULL DEFAULT 'zip_extract',
+                notes TEXT DEFAULT '',
+                is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        `);
+        await db.query(`
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_omnimind_codex_release_target
+            ON omnimind_codex_releases (platform, arch, channel)
+        `);
+        codexReleaseSchemaReady = true;
+    };
+
+    const rowToCodexRelease = (row = {}) => ({
+        id: row.id,
+        platform: toNonEmptyString(row.platform),
+        arch: toNonEmptyString(row.arch),
+        channel: toNonEmptyString(row.channel) || 'stable',
+        version: toNonEmptyString(row.version),
+        url: toNonEmptyString(row.url),
+        checksum: toNonEmptyString(row.checksum),
+        file_name: toNonEmptyString(row.file_name),
+        size_bytes: row.size_bytes === null || row.size_bytes === undefined ? null : Number(row.size_bytes),
+        method: toNonEmptyString(row.method) || 'zip_extract',
+        notes: toNonEmptyString(row.notes),
+        is_active: Boolean(row.is_active),
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    });
+
+    const buildCodexManifest = (releases, requestedPlatform, requestedArch) => {
+        const matrix = {};
+        for (const platformKey of SUPPORTED_PLATFORMS) {
+            matrix[platformKey] = {};
+        }
+
+        const byTarget = new Map();
+        for (const rel of releases || []) {
+            const key = `${rel.platform}:${rel.arch}`;
+            byTarget.set(key, rel);
+            matrix[rel.platform] = matrix[rel.platform] || {};
+            matrix[rel.platform][rel.arch] = {
+                version: rel.version,
+                url: rel.url,
+                method: rel.method,
+                checksum: rel.checksum,
+                file_name: rel.file_name,
+                size: rel.size_bytes,
+            };
+        }
+
+        const fallbackToDefault = (platformKey, arch) => {
+            const defaultMap = DEFAULT_CODEX_RELEASE_MATRIX[platformKey] || {};
+            const item = defaultMap[arch];
+            if (!item || !item.url) return null;
+            return {
+                platform: platformKey,
+                arch,
+                channel: 'stable',
+                version: item.version || '1.5.0',
+                url: item.url,
+                checksum: item.checksum || '',
+                file_name: item.file_name || '',
+                size_bytes: item.size_bytes || null,
+                method: item.method || 'zip_extract',
+            };
+        };
+
+        let selected = byTarget.get(`${requestedPlatform}:${requestedArch}`) || null;
+        if (!selected) {
+            const platformRows = (releases || []).filter((x) => x.platform === requestedPlatform);
+            selected = platformRows.find((x) => x.arch === 'x64')
+                || platformRows.find((x) => x.arch === 'arm64')
+                || platformRows[0]
+                || null;
+        }
+        if (!selected) {
+            selected = fallbackToDefault(requestedPlatform, requestedArch)
+                || fallbackToDefault(requestedPlatform, 'x64')
+                || fallbackToDefault(requestedPlatform, 'arm64');
+        }
+
+        // Bổ sung fallback mặc định vào matrix nếu DB chưa có record.
+        for (const platformKey of Object.keys(DEFAULT_CODEX_RELEASE_MATRIX)) {
+            for (const arch of Object.keys(DEFAULT_CODEX_RELEASE_MATRIX[platformKey] || {})) {
+                const key = `${platformKey}:${arch}`;
+                if (byTarget.has(key)) continue;
+                const item = DEFAULT_CODEX_RELEASE_MATRIX[platformKey][arch];
+                matrix[platformKey] = matrix[platformKey] || {};
+                matrix[platformKey][arch] = {
+                    version: item.version || '1.5.0',
+                    url: item.url,
+                    method: item.method || 'zip_extract',
+                    checksum: item.checksum || '',
+                    file_name: item.file_name || '',
+                    size: item.size_bytes || null,
+                };
+            }
+        }
+
+        const legacyPlatforms = {};
+        for (const platformKey of SUPPORTED_PLATFORMS) {
+            const m = matrix[platformKey] || {};
+            const candidate = m[requestedArch] || m.x64 || m.arm64 || Object.values(m)[0];
+            if (candidate?.url) {
+                legacyPlatforms[platformKey] = {
+                    url: candidate.url,
+                    method: candidate.method || 'zip_extract',
+                    checksum: candidate.checksum || '',
+                    file_name: candidate.file_name || '',
+                    size: candidate.size ?? null,
+                };
+            }
+        }
+
+        return {
+            version: selected?.version || '1.5.0',
+            prerequisites: { python: '>=3.9', node: '>=18.0' },
+            install_policy: {
+                auto_install_runtime: true,
+                windows: {
+                    python_package_id: 'Python.Python.3.11',
+                    node_package_id: 'OpenJS.NodeJS',
+                },
+                darwin: {
+                    python_formula: 'python',
+                    node_formula: 'node',
+                },
+            },
+            platform: requestedPlatform,
+            arch: requestedArch,
+            selected: selected
+                ? {
+                    platform: selected.platform,
+                    arch: selected.arch,
+                    version: selected.version,
+                    url: selected.url,
+                    method: selected.method || 'zip_extract',
+                    checksum: selected.checksum || '',
+                    file_name: selected.file_name || '',
+                    size: selected.size_bytes ?? null,
+                }
+                : {},
+            matrix,
+            platforms: legacyPlatforms,
+        };
     };
 
     const normalizeRequiredCapabilities = (raw) => {
@@ -369,24 +614,24 @@ module.exports = function (app, db, authMiddleware) {
     // PUBLIC: Lấy link tải Codex CLI & Yêu cầu môi trường
     // ─────────────────────────────────────────────────────
     app.get('/api/v1/omnimind/codex/releases', async (req, res) => {
-        // Mock data: Trong thực tế sẽ lấy từ bảng cấu hình hoặc Github API
-        res.json({
-            version: '1.5.0',
-            prerequisites: {
-                python: '>=3.9',
-                node: '>=18.0'
-            },
-            platforms: {
-                darwin: {
-                    url: 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-macos-arm64.zip',
-                    method: 'zip_extract'
-                },
-                win32: {
-                    url: 'https://github.com/Antigravity-AI/codex-cli/releases/download/v1.5.0/codex-windows-x64.zip',
-                    method: 'zip_extract'
-                }
-            }
-        });
+        const requestedPlatform = normalizePlatform(req.query.os_name || req.query.platform || '');
+        const requestedArch = normalizeArch(requestedPlatform, req.query.arch || req.query.cpu_arch || '');
+        try {
+            await ensureCodexReleaseSchema();
+            const result = await db.query(
+                `SELECT * FROM omnimind_codex_releases
+                 WHERE channel = $1 AND is_active = TRUE
+                 ORDER BY updated_at DESC, id DESC`,
+                ['stable']
+            );
+            const rows = result.rows.map(rowToCodexRelease).filter((row) => row.url);
+            const manifest = buildCodexManifest(rows, requestedPlatform, requestedArch);
+            res.json(manifest);
+        } catch (err) {
+            console.error('[OmniMind] Codex release resolve error:', err);
+            const fallback = buildCodexManifest([], requestedPlatform, requestedArch);
+            res.json(fallback);
+        }
     });
 
     // ─────────────────────────────────────────────────────
@@ -738,6 +983,105 @@ module.exports = function (app, db, authMiddleware) {
                 return res.status(404).json({ success: false, error: 'Version not found' });
             }
             res.json({ success: true, message: 'Version deleted' });
+        } catch (err) {
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
+
+    // ─────────────────────────────────────────────────────
+    // ADMIN: Quản lý Codex Release Matrix (OS + Arch)
+    // ─────────────────────────────────────────────────────
+    app.get('/api/v1/admin/omnimind/codex/releases', authMiddleware, async (req, res) => {
+        const channel = toNonEmptyString(req.query.channel) || 'stable';
+        try {
+            await ensureCodexReleaseSchema();
+            const result = await db.query(
+                `SELECT * FROM omnimind_codex_releases
+                 WHERE channel = $1
+                 ORDER BY platform ASC, arch ASC, updated_at DESC, id DESC`,
+                [channel]
+            );
+            res.json({ success: true, data: result.rows.map(rowToCodexRelease) });
+        } catch (err) {
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
+
+    app.post('/api/v1/admin/omnimind/codex/releases', authMiddleware, async (req, res) => {
+        try {
+            await ensureCodexReleaseSchema();
+            const record = normalizeCodexReleaseRecord(req.body || {});
+            const errors = [];
+            if (!record.platform || record.platform === 'unknown') {
+                errors.push('platform không hợp lệ.');
+            }
+            if (!record.arch || record.arch === 'unknown') {
+                errors.push('arch không hợp lệ.');
+            }
+            if (!record.version) {
+                errors.push('Thiếu version.');
+            }
+            if (!record.url) {
+                errors.push('Thiếu url.');
+            }
+            if (!isSupportedReleaseTarget(record.platform, record.arch)) {
+                errors.push('Tổ hợp platform/arch chưa được hỗ trợ.');
+            }
+            if (errors.length) {
+                return res.status(400).json({ success: false, error: errors.join(' ') });
+            }
+
+            const upsert = await db.query(
+                `INSERT INTO omnimind_codex_releases
+                    (platform, arch, channel, version, url, checksum, file_name, size_bytes, method, notes, is_active, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+                 ON CONFLICT (platform, arch, channel)
+                 DO UPDATE SET
+                    version = EXCLUDED.version,
+                    url = EXCLUDED.url,
+                    checksum = EXCLUDED.checksum,
+                    file_name = EXCLUDED.file_name,
+                    size_bytes = EXCLUDED.size_bytes,
+                    method = EXCLUDED.method,
+                    notes = EXCLUDED.notes,
+                    is_active = EXCLUDED.is_active,
+                    updated_at = NOW()
+                 RETURNING *`,
+                [
+                    record.platform,
+                    record.arch,
+                    record.channel,
+                    record.version,
+                    record.url,
+                    record.checksum,
+                    record.file_name,
+                    record.size_bytes,
+                    record.method,
+                    record.notes,
+                    record.is_active,
+                ]
+            );
+            res.json({ success: true, data: rowToCodexRelease(upsert.rows[0]) });
+        } catch (err) {
+            res.status(500).json({ success: false, error: err.message });
+        }
+    });
+
+    app.delete('/api/v1/admin/omnimind/codex/releases/:id', authMiddleware, async (req, res) => {
+        const id = Number(req.params.id);
+        if (!Number.isFinite(id) || id <= 0) {
+            return res.status(400).json({ success: false, error: 'ID không hợp lệ.' });
+        }
+        try {
+            await ensureCodexReleaseSchema();
+            const result = await db.query(
+                'DELETE FROM omnimind_codex_releases WHERE id = $1 RETURNING id',
+                [id]
+            );
+            if (result.rows.length === 0) {
+                return res.status(404).json({ success: false, error: 'Release not found' });
+            }
+            res.json({ success: true, message: 'Codex release deleted' });
         } catch (err) {
             res.status(500).json({ success: false, error: err.message });
         }
