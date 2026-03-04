@@ -84,20 +84,38 @@ app.post('/api/v1/license/validate', async (req, res) => {
 
 app.get('/api/v1/admin/licenses', authMiddleware, async (req, res) => {
     try {
-        const result = await db.query('SELECT * FROM licenses ORDER BY created_at DESC');
-        res.json({ success: true, data: result.rows });
+        const result = await db.query(`
+            SELECT
+                l.*,
+                COALESCE(NULLIF(TRIM(l.machine_id), ''), ld.hwid) AS resolved_machine_id
+            FROM licenses l
+            LEFT JOIN LATERAL (
+                SELECT d.hwid
+                FROM license_devices d
+                WHERE d.license_id = l.id
+                ORDER BY d.last_login DESC NULLS LAST, d.id DESC
+                LIMIT 1
+            ) ld ON TRUE
+            ORDER BY l.created_at DESC, l.id DESC
+        `);
+
+        const normalized = result.rows.map((row) => ({
+            ...row,
+            machine_id: row.resolved_machine_id || null,
+        }));
+        res.json({ success: true, data: normalized });
     } catch (err) {
         res.status(500).json({ success: false, error: err.message });
     }
 });
 
 app.post('/api/v1/admin/licenses', authMiddleware, async (req, res) => {
-    const { license_key, expires_days, note } = req.body;
+    const { license_key, expires_days, note, plan_id, issued_source } = req.body;
     try {
         const expires_at = expires_days ? new Date(Date.now() + expires_days * 24 * 60 * 60 * 1000) : null;
         const result = await db.query(
-            'INSERT INTO licenses (license_key, expires_at, status, note) VALUES ($1, $2, $3, $4) RETURNING *',
-            [license_key, expires_at, 'active', note || '']
+            'INSERT INTO licenses (license_key, expires_at, status, note, plan_id, issued_source) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+            [license_key, expires_at, 'active', note || '', plan_id || 'Standard', issued_source || 'CMS']
         );
         res.json({ success: true, data: result.rows[0] });
     } catch (err) {
@@ -108,6 +126,7 @@ app.post('/api/v1/admin/licenses', authMiddleware, async (req, res) => {
 app.post('/api/v1/admin/licenses/reset', authMiddleware, async (req, res) => {
     const { id } = req.body;
     try {
+        await db.query('DELETE FROM license_devices WHERE license_id = $1', [id]);
         await db.query('UPDATE licenses SET machine_id = NULL, hardware_details = NULL WHERE id = $1', [id]);
         res.json({ success: true, message: 'Binding reset successful' });
     } catch (err) {
@@ -117,8 +136,8 @@ app.post('/api/v1/admin/licenses/reset', authMiddleware, async (req, res) => {
 
 app.patch('/api/v1/admin/licenses/:id', authMiddleware, async (req, res) => {
     const { id } = req.params;
-    const { status, license_key, expires_at, note } = req.body;
-    console.log(`[PATCH] Updating license ${id}:`, { status, license_key, expires_at, note });
+    const { status, license_key, expires_at, note, plan_id, issued_source } = req.body;
+    console.log(`[PATCH] Updating license ${id}:`, { status, license_key, expires_at, note, plan_id, issued_source });
     try {
         const fields = [];
         const values = [];
@@ -128,6 +147,8 @@ app.patch('/api/v1/admin/licenses/:id', authMiddleware, async (req, res) => {
         if (license_key !== undefined) { fields.push(`license_key = $${i++}`); values.push(license_key); }
         if (expires_at !== undefined) { fields.push(`expires_at = $${i++}`); values.push(expires_at === null ? null : new Date(expires_at)); }
         if (note !== undefined) { fields.push(`note = $${i++}`); values.push(note); }
+        if (plan_id !== undefined) { fields.push(`plan_id = $${i++}`); values.push(plan_id || 'Standard'); }
+        if (issued_source !== undefined) { fields.push(`issued_source = $${i++}`); values.push(issued_source || 'CMS'); }
 
         if (fields.length === 0) return res.status(400).json({ success: false, error: 'No fields provided' });
 
